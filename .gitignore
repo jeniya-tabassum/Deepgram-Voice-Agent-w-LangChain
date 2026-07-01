@@ -1,0 +1,26 @@
+# --- secrets: NEVER commit real keys ---
+.env
+.env.local
+*.env
+
+# keep the template
+!.env.example
+
+# --- python virtualenv (336 MB, recreated from requirements.txt) ---
+.venv/
+venv/
+env/
+
+# --- python caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- os / editor cruft ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

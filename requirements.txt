@@ -1,0 +1,13 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+python-dotenv>=1.0.0
+
+# --- LangChain (the "brain" of the voice agent) ---
+langchain>=1.0.0
+langchain-openai>=1.0.0
+langchain-community>=0.4.0
+langgraph>=1.0.0             # the StateGraph brain (triage -> retrieve -> coverage -> schedule -> compose)
+pydantic>=2.0.0             # structured triage output
+grandalf>=0.8              # renders the LangGraph topology as ASCII at startup
+scikit-learn>=1.3.0          # backs LangChain's TFIDFRetriever (no embeddings API key needed)
