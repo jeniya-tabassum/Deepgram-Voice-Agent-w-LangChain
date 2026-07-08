@@ -1,0 +1,20 @@
+# Fly.io config for the Deepgram + LangChain voice agent.
+# Deploy:  flyctl deploy
+# Secrets (set once, NOT in this file):
+#   flyctl secrets set DEEPGRAM_API_KEY=... OPENAI_API_KEY=... LANGCHAIN_LLM_MODEL=gpt-4o-mini
+
+app = "dg-langchain-voice-agent"
+primary_region = "sjc"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true            # mic access (getUserMedia) requires a secure context
+  auto_stop_machines = "stop"   # scale to zero when idle to save cost
+  auto_start_machines = true    # wake on the next request
+  min_machines_running = 0      # set to 1 to keep it warm for a live demo
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"                # headroom for scikit-learn / numpy / langchain

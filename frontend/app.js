@@ -1,4 +1,4 @@
-/* Summit Motors — browser voice client.
+/* Ascent Automotive Group — browser voice client.
  *
  * Responsibilities:
  *   - capture mic audio, downsample to 16 kHz PCM16, stream to the backend WS
@@ -18,6 +18,9 @@ const transcriptEl = document.getElementById("transcript");
 const emptyHint = document.getElementById("emptyHint");
 const graphPathEl = document.getElementById("graphPath");
 const agentTraceEl = document.getElementById("agentTrace");
+const turnStateEl = document.getElementById("turnState");
+const eotCaptionEl = document.getElementById("eotCaption");
+const hitlBanner = document.getElementById("hitlBanner");
 
 let ws = null;
 let micStream = null;
@@ -34,6 +37,23 @@ callBtn.addEventListener("click", () => (inCall ? stopCall() : startCall()));
 function setStatus(text, live) {
   statusText.textContent = text;
   dot.classList.toggle("live", !!live);
+}
+
+// Turn-taking indicator (#4): reflects who "has the floor" so the demo can show
+// that Flux waits for the caller to finish rather than firing on a fixed timer.
+function setTurn(state, label) {
+  if (!turnStateEl) return;
+  turnStateEl.className = "turn-state" + (state ? " " + state : "");
+  turnStateEl.innerHTML = `<span class="tdot"></span>${label}`;
+}
+
+// Render the active Flux end-of-utterance config sent by the backend on connect.
+function renderTurnConfig(tt) {
+  if (!eotCaptionEl || !tt) return;
+  const secs = (tt.eot_timeout_ms / 1000).toFixed(0);
+  let s = `Flux · ends turn at ≥${Number(tt.eot_threshold).toFixed(2)} confidence · waits up to ${secs}s pause`;
+  if (tt.eager_eot_threshold) s += ` · eager ${Number(tt.eager_eot_threshold).toFixed(2)}`;
+  eotCaptionEl.textContent = s;
 }
 
 function addMessage(role, text) {
@@ -75,6 +95,7 @@ async function startCall() {
     callBtn.textContent = "⏹ End call";
     callBtn.classList.add("stop");
     setStatus("Connected — listening", true);
+    setTurn("listening", "👂 Listening");
     startMicCapture();
   };
 
@@ -96,6 +117,7 @@ function stopCall() {
   callBtn.classList.remove("stop");
   callBtn.disabled = false;
   setStatus("Idle");
+  setTurn("", "Waiting to start");
   flushPlayback();
 
   if (processor) { processor.disconnect(); processor = null; }
@@ -121,8 +143,14 @@ function handleEvent(evt) {
     case "function_call":
       addMessage("tool", `🧠 LangGraph brain · ${evt.arguments?.question ?? evt.name}`);
       break;
+    case "config":
+      renderTurnConfig(evt.turn_taking);
+      break;
     case "graph_start":
-      agentReset();
+      // resume=true means the brain is continuing a PAUSED graph from its
+      // checkpoint (human-in-the-loop), not starting a fresh turn.
+      if (evt.resume) agentResume();
+      else agentReset();
       break;
     case "agent_step":
       agentStep(evt);
@@ -132,9 +160,13 @@ function handleEvent(evt) {
       break;
     case "user_started_speaking":
       flushPlayback(); // barge-in
+      setTurn("caller", "🎙 Caller speaking");
       break;
     case "status":
       if (evt.event === "Error") setStatus("Deepgram error — see console");
+      else if (evt.event === "AgentThinking") setTurn("thinking", "💭 Agent thinking");
+      else if (evt.event === "AgentStartedSpeaking") setTurn("agent", "🔊 Agent speaking");
+      else if (evt.event === "AgentAudioDone") setTurn("listening", "👂 Listening — waiting for you to finish");
       console.log("[status]", evt.event, evt.detail);
       break;
     default:
@@ -151,6 +183,12 @@ function handleEvent(evt) {
 const AGENT_TOOL_IDS = ["search", "inventory", "calculator", "tradein", "booking"];
 let agentStepCount = 0;
 let agentCallCounts = {};
+let agentPaused = false; // true while the graph is paused for human-in-the-loop
+
+function clearHitl() {
+  AGENT_TOOL_IDS.forEach((n) => gToggle(`gn-${n}`, "paused", false));
+  if (hitlBanner) hitlBanner.className = "hitl-banner";
+}
 
 function gEl(id) { return document.getElementById(id); }
 function gToggle(id, cls, on) { const el = gEl(id); if (el) el.classList.toggle(cls, on); }
@@ -167,6 +205,8 @@ function agentReset() {
   });
   agentStepCount = 0;
   agentCallCounts = {};
+  agentPaused = false;
+  clearHitl();
   gToggle("gn-start", "done", true);
   gToggle("edge-start-agent", "done", true);
   gToggle("gn-agent", "done", true);
@@ -217,10 +257,59 @@ function agentStep(evt) {
       rows[rows.length - 1].appendChild(res);
       agentTraceEl.scrollTop = agentTraceEl.scrollHeight;
     }
+  } else if (evt.kind === "interrupt") {
+    agentInterrupt(evt);
+  } else if (evt.kind === "filler") {
+    // The agent spoke a short "let me look that up" filler to mask brain latency.
+    agentAddTrace(`🗣 <span class="args">spoke filler: “${escapeHtml(evt.text || "")}”</span>`, "filler");
   }
 }
 
+// Human-in-the-loop (#3): the graph paused at a node (e.g. book_appointment) and
+// is waiting for the caller to confirm. Show the node as paused + a banner.
+function agentInterrupt(evt) {
+  agentPaused = true;
+  const ui = evt.ui || "booking";
+  gToggle(`gn-${ui}`, "current", false);
+  gToggle(`gn-${ui}`, "paused", true);
+  gToggle("gn-agent", "current", false);
+  const node = ui === "booking" ? "book_appointment" : ui;
+  if (hitlBanner) {
+    hitlBanner.className = "hitl-banner show";
+    hitlBanner.textContent = "⏸ Human-in-the-loop — graph paused at " + node + ", waiting for the caller to confirm.";
+  }
+  if (graphPathEl) graphPathEl.innerHTML = `⏸ <b>paused</b> at ${node} · state saved to checkpoint`;
+  agentAddTrace(
+    `<span class="tool">⏸ interrupt()</span> ` +
+    `<span class="args">${escapeHtml(evt.prompt || "awaiting caller confirmation")}</span>`,
+    "paused"
+  );
+  setTurn("listening", "👂 Waiting for caller to confirm");
+}
+
+// Resume from checkpoint: continue the SAME graph at the paused node — do NOT
+// reset the trace, so the demo can see it pick up where it left off.
+function agentResume() {
+  agentPaused = false;
+  AGENT_TOOL_IDS.forEach((n) => gToggle(`gn-${n}`, "paused", false));
+  gToggle("gn-agent", "current", true);
+  if (hitlBanner) {
+    hitlBanner.className = "hitl-banner show resumed";
+    hitlBanner.textContent = "▶ Resumed from checkpoint — same graph, same node (not restarted).";
+  }
+  if (graphPathEl) graphPathEl.innerHTML = "<b>▶</b> resuming from checkpoint…";
+  agentAddTrace("▶ <b>resumed from checkpoint</b> — continued at the paused node", "resume");
+}
+
 function agentDone() {
+  if (agentPaused) {
+    // Graph paused mid-flight for human-in-the-loop; keep the paused visuals up
+    // (the "turn" ended only because we handed control back to the caller).
+    gToggle("gn-agent", "current", false);
+    if (graphPathEl) graphPathEl.innerHTML = "⏸ <b>paused</b> — waiting for the caller to confirm";
+    return;
+  }
+  clearHitl();
   gToggle("gn-agent", "current", false);
   gToggle("edge-agent-end", "done", true);
   gToggle("gn-end", "done", true);

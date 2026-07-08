@@ -11,7 +11,7 @@ To showcase **multi-step agent reasoning**, the brain is a LangChain
 breaks a complex query into sequential steps and decides *which tools to call, in
 what order* — chaining them until it can answer. It has five domain tools:
 
-  1. search_dealership_info   -> RAG over the Summit Motors knowledge base
+  1. search_dealership_info   -> RAG over the Ascent Automotive Group knowledge base
   2. check_inventory          -> look up vehicle availability + starting price
   3. calculate_monthly_payment-> a financing CALCULATOR (loan amortization)
   4. estimate_trade_in        -> value a customer's current car
@@ -20,9 +20,9 @@ what order* — chaining them until it can answer. It has five domain tools:
 Example of the multi-step reasoning this enables — "I have a 2018 Civic with 60k
 miles to trade in; what's the monthly payment on a new RAV4?":
 
-    ① estimate_trade_in(Civic, 2018, 60000)  -> ~$9,400
+    ① estimate_trade_in(Civic, 2018, 60000)  -> ~$5,200
     ② check_inventory(Toyota, RAV4, new)      -> from $27,990
-    ③ calculate_monthly_payment(27990, down=9400) -> ~$364/mo
+    ③ calculate_monthly_payment(27990, down=5200) -> ~$450/mo
     -> one short spoken answer
 
 The agent decides that sequence itself. Swap ChatOpenAI for any LangChain chat
@@ -41,6 +41,8 @@ from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import TFIDFRetriever
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
 
 from .knowledge_base import FAQ_METADATAS, FAQ_TEXTS
 
@@ -65,7 +67,7 @@ _USED_FROM = 15990
 # --------------------------------------------------------------------------- #
 @tool
 def search_dealership_info(query: str) -> str:
-    """Search the Summit Motors knowledge base for general information about
+    """Search the Ascent Automotive Group knowledge base for general information about
     financing, warranties, trade-in process, returns policy, hours, and delivery.
     Use this for any 'how does X work' or policy question."""
     docs = _retriever.invoke(query)
@@ -171,6 +173,22 @@ def estimate_trade_in(
     })
 
 
+def _looks_negative(reply) -> bool:
+    """True if the caller's confirmation reply reads as 'no / not yet / change it'.
+
+    Deliberately conservative: we only BLOCK the booking on a clear negative, so an
+    ambiguous 'yeah ok sure' proceeds. 'yes' anywhere wins immediately.
+    """
+    text = str(reply or "").strip().lower()
+    if not text:
+        return False  # empty resume value -> treat as go-ahead
+    if text.startswith(("yes", "yep", "yeah", "sure", "correct", "go ahead", "confirm")):
+        return False
+    negatives = ("no", "nope", "don't", "do not", "cancel", "stop", "wait",
+                 "not yet", "hold on", "change", "different", "instead")
+    return any(word in text for word in negatives)
+
+
 @tool
 def book_appointment(
     appointment_type: str,
@@ -183,7 +201,6 @@ def book_appointment(
     test_drive, service, or financing. Provide the vehicle make/model, a callback
     phone number, and a preferred time. Returns a JSON confirmation with a
     reference number (APT-XXXXXX)."""
-    ref = "APT-" + uuid.uuid4().hex[:6].upper()
     type_label = {
         "test_drive": "test drive",
         "service": "service appointment",
@@ -191,6 +208,39 @@ def book_appointment(
     }.get((appointment_type or "").lower(), "appointment")
     when = preferred_time or "the next available slot"
     vehicle = f"{make} {model}".strip() or "your vehicle"
+
+    # --- Human-in-the-loop checkpoint --------------------------------------- #
+    # Pause the graph and CONFIRM with the caller BEFORE committing the booking.
+    # interrupt() snapshots graph state to the checkpointer and unwinds; when the
+    # caller answers, the graph RESUMES *at this node* (prior tool results are
+    # loaded from the checkpoint — the graph does NOT restart) with `decision` set
+    # to their spoken reply. This is the "resume from the same node" behavior.
+    decision = interrupt({
+        "action": "confirm_booking",
+        "ui": "booking",  # which graph node the UI should render as paused
+        "appointment_type": type_label,
+        "vehicle": vehicle,
+        "preferred_time": when,
+        # `prompt` is what the voice agent should say to the caller.
+        "prompt": (
+            f"I'm about to book a {type_label} for the {vehicle} at {when}"
+            + (f", and I'll use {contact_phone} as your callback number" if contact_phone else "")
+            + ". Should I go ahead and book it?"
+        ),
+    })
+
+    # Reached only after the caller responds and the graph resumes here.
+    if _looks_negative(decision):
+        return json.dumps({
+            "appointment_type": type_label, "vehicle": vehicle,
+            "status": "Not booked",
+            "message": (
+                f"No problem — I won't book the {type_label} yet. "
+                "Just tell me what you'd like to change."
+            ),
+        })
+
+    ref = "APT-" + uuid.uuid4().hex[:6].upper()
     return json.dumps({
         "reference": ref, "appointment_type": type_label, "vehicle": vehicle,
         "contact_phone": contact_phone or "your number on file",
@@ -221,7 +271,7 @@ TOOL_UI_IDS = {
 # 3. The agent
 # --------------------------------------------------------------------------- #
 _SYSTEM_PROMPT = (
-    "You are the customer-care brain for Summit Motors, a car dealership. You answer questions "
+    "You are the customer-care brain for Ascent Automotive Group, a car dealership. You answer questions "
     "coming from a live phone/voice conversation, so your FINAL answer must be SHORT and "
     "conversational — one or two sentences, no markdown, no lists.\n\n"
     "You have tools and you REASON IN MULTIPLE STEPS: break a complex request into a sequence of "
@@ -235,6 +285,9 @@ _SYSTEM_PROMPT = (
     "- Use estimate_trade_in when the customer mentions trading in a car; its estimated_value can "
     "be used as the down_payment for calculate_monthly_payment.\n"
     "- Use book_appointment only when the customer wants to book.\n"
+    "- Always refer to a vehicle by the EXACT make and model the customer named, and pass those exact "
+    "values to the tools. Never substitute, guess, or drift to a different model (e.g. do not answer "
+    "about a Highlander when the customer asked about a RAV4).\n"
     "Never invent prices, inventory, payments, or policies — ground every number in a tool result. "
     "If a needed detail is missing, ask one brief question."
 )
@@ -243,10 +296,19 @@ _SYSTEM_PROMPT = (
 def build_support_agent():
     """Construct the LangChain multi-step tool-calling agent (a compiled LangGraph
     agent⇄tools loop). Called once at startup; returns a compiled graph exposing
-    the `.astream(...)` / `.ainvoke(...)` interface the bridge uses."""
+    the `.astream(...)` / `.ainvoke(...)` interface the bridge uses.
+
+    A checkpointer is required for human-in-the-loop: it persists graph state at
+    each step so a call that hits interrupt() (see book_appointment) can be
+    RESUMED from that node on a later turn instead of restarting. State is keyed by
+    the `thread_id` the bridge passes per call (see run_support_brain). InMemorySaver
+    keeps the demo dependency-light; swap for a PostgresSaver/RedisSaver to persist
+    across process restarts and scale horizontally."""
     model = os.environ.get("LANGCHAIN_LLM_MODEL", "gpt-4o-mini")
     llm = ChatOpenAI(model=model, temperature=0, max_tokens=500)
-    return create_agent(llm, tools=TOOLS, system_prompt=_SYSTEM_PROMPT)
+    return create_agent(
+        llm, tools=TOOLS, system_prompt=_SYSTEM_PROMPT, checkpointer=InMemorySaver()
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -271,9 +333,20 @@ def _short(value, limit: int = 90) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-async def run_support_brain(agent, question: str, on_event=None) -> str:
-    """Run the multi-step agent for one customer question and return a plain-text
-    answer the voice agent can speak aloud.
+async def run_support_brain(
+    agent, question: str, thread_id: str, resume: bool = False, on_event=None
+) -> dict:
+    """Run the multi-step agent for one customer turn.
+
+    Returns {"content": <text the voice agent should speak>, "interrupted": bool}.
+    When `interrupted` is True, `content` is a confirmation question and the graph
+    is PAUSED at a node (see book_appointment); the bridge should send the caller's
+    next reply back with resume=True to continue from that node.
+
+    `thread_id` scopes the graph's persisted state so each phone call has its own
+    conversation/checkpoint. `resume=False` starts a fresh turn from the user's
+    message; `resume=True` feeds `question` (the caller's reply) into the paused
+    interrupt() via Command(resume=...), resuming the graph in place.
 
     If `on_event` is provided, it is awaited for each reasoning step so a UI can
     visualize the agent's tool-calling loop live. We stream with
@@ -281,8 +354,10 @@ async def run_support_brain(agent, question: str, on_event=None) -> str:
       - AIMessage with tool_calls  -> the agent decided to call tool(s)
       - ToolMessage                -> a tool returned a result
       - AIMessage without tool_calls -> the final spoken answer
+      - a "__interrupt__" chunk    -> the graph paused for human confirmation
     Event shapes: {"kind": "tool_call", "step", "name", "ui", "args"},
-                  {"kind": "tool_result", "name", "ui", "result"}.
+                  {"kind": "tool_result", "name", "ui", "result"},
+                  {"kind": "interrupt", "prompt"}.
     """
     async def emit(payload: dict) -> None:
         if on_event is not None:
@@ -291,12 +366,29 @@ async def run_support_brain(agent, question: str, on_event=None) -> str:
             except Exception:  # noqa: BLE001 - UI streaming must never break the answer
                 pass
 
+    config = {"configurable": {"thread_id": thread_id}}
+    graph_input = Command(resume=question) if resume else {
+        "messages": [{"role": "user", "content": question}]
+    }
+
     try:
         answer, step, trace = "", 0, []
-        async for chunk in agent.astream(
-            {"messages": [{"role": "user", "content": question}]},
-            stream_mode="updates",
-        ):
+        interrupt_prompt = None
+        async for chunk in agent.astream(graph_input, config=config, stream_mode="updates"):
+            # A pause surfaces as a top-level "__interrupt__" key whose value is a
+            # tuple of Interrupt objects; .value is the dict book_appointment passed.
+            if "__interrupt__" in chunk:
+                intr = chunk["__interrupt__"][0]
+                val = getattr(intr, "value", None)
+                if isinstance(val, dict):
+                    interrupt_prompt = val.get("prompt")
+                    interrupt_ui = val.get("ui")
+                else:
+                    interrupt_prompt = str(val) if val is not None else None
+                    interrupt_ui = None
+                trace.append("interrupt")
+                await emit({"kind": "interrupt", "prompt": interrupt_prompt, "ui": interrupt_ui})
+                continue
             for _node, update in chunk.items():
                 if not isinstance(update, dict):
                     continue
@@ -325,11 +417,20 @@ async def run_support_brain(agent, question: str, on_event=None) -> str:
                             "result": _short(_extract_text(m.content)),
                         })
         if trace:
-            print(f"[brain] steps: {' -> '.join(trace)} -> answer")
-        return answer or "I'm sorry, I wasn't able to find an answer to that."
+            tail = "paused" if interrupt_prompt is not None else "answer"
+            print(f"[brain] steps: {' -> '.join(trace)} -> {tail}")
+        if interrupt_prompt is not None:
+            return {"content": interrupt_prompt, "interrupted": True}
+        return {
+            "content": answer or "I'm sorry, I wasn't able to find an answer to that.",
+            "interrupted": False,
+        }
     except Exception as exc:  # noqa: BLE001 - surface a speakable fallback
         print(f"[langchain_brain] error: {exc!r}")
-        return (
-            "I'm having trouble pulling that up right now. "
-            "I can connect you with a sales specialist who can follow up with you."
-        )
+        return {
+            "content": (
+                "I'm having trouble pulling that up right now. "
+                "I can connect you with a sales specialist who can follow up with you."
+            ),
+            "interrupted": False,
+        }

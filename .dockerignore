@@ -1,0 +1,19 @@
+# never ship secrets or the local virtualenv into the image
+.env
+.env.local
+.venv/
+venv/
+
+# vcs / caches / cruft
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# docs not needed at runtime
+DEMO_PITCH.md
+slides.html

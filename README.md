@@ -119,7 +119,7 @@ providers — and declares **exactly one function**, `ask_support_brain`:
 "functions": [
     {
         "name": "ask_support_brain",
-        "description": "Send the customer's question to the Summit Motors brain …",
+        "description": "Send the customer's question to the Ascent Automotive Group brain …",
         "parameters": { "type": "object", "properties": { "question": {"type": "string"} }, "required": ["question"] },
         # NOTE: no "endpoint" key  =>  this is a CLIENT-SIDE function.
     }

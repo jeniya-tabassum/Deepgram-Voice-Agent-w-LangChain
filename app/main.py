@@ -14,6 +14,7 @@ LangChain agent and send back a FunctionCallResponse — all over the same socke
 import asyncio
 import json
 import os
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -22,7 +23,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from websockets.exceptions import ConnectionClosed
 
-from .deepgram_agent import build_settings, connect_deepgram
+from .deepgram_agent import (
+    FILLER_DELAY_MS,
+    build_settings,
+    choose_filler,
+    connect_deepgram,
+    turn_taking_summary,
+)
 from .langchain_brain import build_support_agent, run_support_brain
 
 # override=True so the project's .env is authoritative even if a (possibly stale
@@ -31,7 +38,7 @@ load_dotenv(override=True)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-app = FastAPI(title="Summit Motors — Deepgram + LangChain Voice Agent")
+app = FastAPI(title="Ascent Automotive Group — Deepgram + LangChain Voice Agent")
 
 # Built once at startup and reused for every call.
 _support_agent = None
@@ -60,10 +67,16 @@ async def index() -> FileResponse:
 
 
 # ---- the bridge --------------------------------------------------------------
-async def _handle_function_call(fn: dict, dg, browser: WebSocket) -> None:
+async def _handle_function_call(fn: dict, dg, browser: WebSocket, session: dict) -> None:
     """Run one client-side function call through LangChain and reply to Deepgram.
 
     Spawned as a background task so audio keeps flowing while the brain thinks.
+
+    `session` holds the per-call graph state: a stable `thread_id` (so the brain's
+    checkpointed state follows this one phone call) and `pending_interrupt` (set
+    when the graph paused for human confirmation). While a pause is pending, the
+    caller's next reply RESUMES the graph from the interrupted node instead of
+    starting a new turn.
     """
     name = fn.get("name")
     call_id = fn.get("id")
@@ -80,9 +93,51 @@ async def _handle_function_call(fn: dict, dg, browser: WebSocket) -> None:
         async def _on_event(payload: dict) -> None:
             await _safe_send_text(browser, {"type": "agent_step", **payload})
 
-        await _safe_send_text(browser, {"type": "graph_start"})
-        content = await run_support_brain(_support_agent, args.get("question", ""), on_event=_on_event)
+        # If the graph is paused awaiting confirmation, this turn resumes it.
+        resume = session.get("pending_interrupt", False)
+        session["pending_interrupt"] = False
+
+        # Mask latency: if the brain takes longer than FILLER_DELAY_MS, speak a
+        # short "let me look that up" filler so the caller isn't left in silence.
+        # Cancelled the moment the answer is ready, so fast turns stay filler-free.
+        async def _speak_filler() -> None:
+            try:
+                await asyncio.sleep(FILLER_DELAY_MS / 1000)
+                # Match the filler to what was asked (carrying context across a
+                # yes/no confirmation turn), and don't repeat the last one.
+                msg, category = choose_filler(
+                    args.get("question", ""),
+                    last_category=session.get("filler_category"),
+                    avoid=session.get("last_filler"),
+                )
+                session["last_filler"] = msg["message"]
+                session["filler_category"] = category
+                await dg.send(json.dumps(msg))
+                await _on_event({"kind": "filler", "text": msg["message"]})
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - filler must never break the call
+                pass
+
+        filler_task = asyncio.create_task(_speak_filler())
+
+        await _safe_send_text(browser, {"type": "graph_start", "resume": resume})
+        try:
+            result = await run_support_brain(
+                _support_agent,
+                args.get("question", ""),
+                thread_id=session["thread_id"],
+                resume=resume,
+                on_event=_on_event,
+            )
+        finally:
+            filler_task.cancel()
         await _safe_send_text(browser, {"type": "graph_done"})
+        content = result["content"]
+        # If the graph paused for human-in-the-loop, remember it so the caller's
+        # next reply is routed back in as a resume rather than a fresh question.
+        if result.get("interrupted"):
+            session["pending_interrupt"] = True
     else:
         content = f"Unknown function '{name}'."
 
@@ -99,7 +154,7 @@ async def _handle_function_call(fn: dict, dg, browser: WebSocket) -> None:
     await _safe_send_text(browser, {"type": "function_result", "name": name, "content": content})
 
 
-async def _handle_dg_event(message: str, dg, browser: WebSocket) -> None:
+async def _handle_dg_event(message: str, dg, browser: WebSocket, session: dict) -> None:
     """Handle a JSON (text) event from Deepgram."""
     try:
         data = json.loads(message)
@@ -112,7 +167,7 @@ async def _handle_dg_event(message: str, dg, browser: WebSocket) -> None:
         for fn in data.get("functions", []):
             # client_side defaults to True for functions with no endpoint.
             if fn.get("client_side", True):
-                asyncio.create_task(_handle_function_call(fn, dg, browser))
+                asyncio.create_task(_handle_function_call(fn, dg, browser, session))
         return
 
     if msg_type == "ConversationText":
@@ -141,6 +196,14 @@ async def ws_endpoint(browser: WebSocket) -> None:
     dg = await connect_deepgram()
     await dg.send(json.dumps(build_settings()))
 
+    # Per-call state. thread_id scopes the LangGraph brain's checkpointed state to
+    # THIS call; pending_interrupt tracks whether the brain is paused for human
+    # confirmation (so the next reply resumes the graph). See _handle_function_call.
+    session = {"thread_id": uuid.uuid4().hex, "pending_interrupt": False}
+
+    # Tell the UI how turn-taking is tuned, so the demo can show the EOT settings.
+    await _safe_send_text(browser, {"type": "config", "turn_taking": turn_taking_summary()})
+
     async def browser_to_deepgram() -> None:
         while True:
             msg = await browser.receive()
@@ -159,7 +222,7 @@ async def ws_endpoint(browser: WebSocket) -> None:
                 except (WebSocketDisconnect, RuntimeError):
                     break
             else:
-                await _handle_dg_event(message, dg, browser)
+                await _handle_dg_event(message, dg, browser, session)
 
     # Run both directions; as soon as either side closes, cancel the other so we
     # don't try to send on a closed socket.

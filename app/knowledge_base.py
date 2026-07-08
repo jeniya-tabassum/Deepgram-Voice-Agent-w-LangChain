@@ -6,14 +6,14 @@ Confluence, a database, etc., and you'd index them in a proper vector store.
 Here we keep them as plain strings and let LangChain's TFIDFRetriever index
 them in-memory so the demo runs with zero extra infrastructure or API keys.
 
-Theme: "Summit Motors" — a fictional car dealership customer-care line.
+Theme: "Ascent Automotive Group" — a fictional car dealership customer-care line.
 """
 
 FAQ_DOCS = [
     {
         "topic": "financing",
         "content": (
-            "Financing and loans: Summit Motors offers financing on new, used, and certified "
+            "Financing and loans: Ascent Automotive Group offers financing on new, used, and certified "
             "pre-owned vehicles. Customers can get pre-approved in minutes; APR depends on credit "
             "score, loan term, and down payment. A typical down payment is 10-20% of the vehicle "
             "price, and terms run from 36 to 72 months. We work with multiple lenders, and "
@@ -35,7 +35,7 @@ FAQ_DOCS = [
     {
         "topic": "trade_in",
         "content": (
-            "Trade-ins: Summit Motors accepts trade-ins and applies the appraised value toward the "
+            "Trade-ins: Ascent Automotive Group accepts trade-ins and applies the appraised value toward the "
             "price of your next vehicle, which can also reduce the sales tax you owe. To appraise a "
             "trade-in we need the make, model, year, mileage, and overall condition. Bring the title "
             "or loan payoff information and both key fobs. A same-day written offer is provided and "
@@ -66,7 +66,7 @@ FAQ_DOCS = [
     {
         "topic": "returns_and_delivery",
         "content": (
-            "Return policy, hours, and delivery: Summit Motors offers a 7-day or 500-mile "
+            "Return policy, hours, and delivery: Ascent Automotive Group offers a 7-day or 500-mile "
             "money-back guarantee on most vehicles so customers can buy with confidence. The "
             "showroom is open Monday to Saturday, 9am to 7pm, and closed Sunday. Home delivery is "
             "available within 50 miles for a flat fee, and out-of-state buyers can arrange shipping."
